@@ -15,6 +15,9 @@ from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import OneHotEncoder
 
 from inspect_data import load, summarize
 
@@ -48,6 +51,8 @@ def main():
     data = [r for r in rows if usable(r)]
     if len(data) < 50:
         raise SystemExit('Need at least 50 successful rows with valid token counts.')
+    if any(not isinstance(r.get('category'), str) or not r['category'].strip() for r in data):
+        raise SystemExit('Every usable row must have a nonempty category.')
     ids = [r.get('id') for r in data if r.get('id') is not None]
     if len(ids) != len(set(ids)):
         raise SystemExit('Duplicate IDs detected; resolve them before training to prevent leakage.')
@@ -55,6 +60,7 @@ def main():
     if len(fingerprints) != 1:
         raise SystemExit('Multiple model versions or generation settings detected; filter to one configuration before training.')
     x = np.array([[r['input_tokens']] for r in data], dtype=float)
+    x_category = np.array([[r['input_tokens'], r['category']] for r in data], dtype=object)
     y = np.array([r['output_tokens'] for r in data], dtype=float)
     indices = np.arange(len(data))
     trainval, test = train_test_split(indices, test_size=0.2, random_state=args.seed)
@@ -66,18 +72,32 @@ def main():
         'boosted_median': HistGradientBoostingRegressor(loss='absolute_error', max_iter=150, max_leaf_nodes=15, min_samples_leaf=50, l2_regularization=1, random_state=args.seed),
         'boosted_mean': HistGradientBoostingRegressor(loss='squared_error', max_iter=150, max_leaf_nodes=15, min_samples_leaf=50, l2_regularization=1, random_state=args.seed),
     }
+    def category_model(estimator):
+        return make_pipeline(ColumnTransformer([
+            ('tokens', 'passthrough', [0]),
+            ('category', OneHotEncoder(handle_unknown='ignore', sparse_output=False), [1]),
+        ]), estimator)
+
+    candidates.update({
+        'category_linear': category_model(LinearRegression()),
+        'category_boosted_median': category_model(HistGradientBoostingRegressor(loss='absolute_error', max_iter=150, max_leaf_nodes=15, min_samples_leaf=50, l2_regularization=1, random_state=args.seed)),
+        'category_boosted_mean': category_model(HistGradientBoostingRegressor(loss='squared_error', max_iter=150, max_leaf_nodes=15, min_samples_leaf=50, l2_regularization=1, random_state=args.seed)),
+    })
     validation = {}
     for name, model in candidates.items():
-        model.fit(x[train], y[train])
-        validation[name] = metrics(y[val], model.predict(x[val]))
-    selected = min(validation, key=lambda n: validation[n]['mae'])
+        features = x_category if name.startswith('category_') else x
+        model.fit(features[train], y[train])
+        validation[name] = metrics(y[val], model.predict(features[val]))
+    selected = min((n for n in validation if n.startswith('category_')), key=lambda n: validation[n]['mae'])
     test_metrics = {}
     for name, model in candidates.items():
-        model.fit(x[trainval], y[trainval])
-        test_metrics[name] = metrics(y[test], model.predict(x[test]))
+        features = x_category if name.startswith('category_') else x
+        model.fit(features[trainval], y[trainval])
+        test_metrics[name] = metrics(y[test], model.predict(features[test]))
     settings = data[0].get('settings') or {}
     metadata = {'model_name': data[0].get('model'), 'model_digest': data[0].get('model_digest'),
                 'settings': settings, 'input_min': float(x.min()), 'input_max': float(x.max()),
+                'categories': sorted(set(r['category'] for r in data)), 'features': ['input_tokens', 'category'],
                 'target': 'observed output_tokens, including generation length limits', 'sklearn_version': sklearn.__version__}
     report = {'audit': summarize(rows), 'excluded_rows': len(rows) - len(data),
               'split': {'train': len(train), 'validation': len(val), 'test': len(test), 'seed': args.seed,
